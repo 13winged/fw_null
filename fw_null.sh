@@ -1,12 +1,11 @@
 #!/bin/bash
+set -euo pipefail
 
-# fw_null - Firewall Nullifier Script
-# Version: 1.0.0
-# Description: Reset firewall rules to default (ACCEPT ALL) and disable UFW
+# fw_null - One-Click Firewall Nullifier Script
+# Version: 2.0.0
+# Description: Automatically resets firewall rules to default (ACCEPT ALL) and disables UFW
 # Author: System Administrator
 # License: MIT
-
-set -e
 
 # Color codes for output
 readonly RED='\033[0;31m'
@@ -18,13 +17,15 @@ readonly BOLD='\033[1m'
 
 # Script configuration
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
-readonly BACKUP_DIR="/root/fw_backups"
-readonly TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-readonly BACKUP_PATH="${BACKUP_DIR}/${TIMESTAMP}"
+readonly SCRIPT_VERSION="2.0.0"
 
-# Log file
-readonly LOG_FILE="/var/log/fw_null.log"
+# Configuration defaults
+DEFAULT_BACKUP_DIR="/root/fw_backups"
+DEFAULT_LOG_FILE="/var/log/fw_null.log"
+readonly TMP_DIR="/tmp/fw_null_$$"
+
+# Trap to clean up temporary files
+trap 'rm -rf "$TMP_DIR" 2>/dev/null' EXIT
 
 # Function to print colored output
 print_msg() {
@@ -36,313 +37,323 @@ print_msg() {
 # Function to print section header
 print_header() {
     local msg=$1
-    echo
-    print_msg "$BLUE" "${BOLD}════════════════════════════════════════════${NC}"
-    print_msg "$BLUE" "${BOLD}  $msg${NC}"
-    print_msg "$BLUE" "${BOLD}════════════════════════════════════════════${NC}"
-}
-
-# Function to print success message
-print_success() {
-    print_msg "$GREEN" "  ✅ $1"
-}
-
-# Function to print warning message
-print_warning() {
-    print_msg "$YELLOW" "  ⚠️  $1"
+    echo -e "\n${BOLD}${BLUE}=== $msg ===${NC}"
 }
 
 # Function to print error message
 print_error() {
-    print_msg "$RED" "  ❌ $1"
+    local msg=$1
+    echo -e "${RED}ERROR: ${msg}${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $msg" >> "${DEFAULT_LOG_FILE}" 2>/dev/null
+}
+
+# Function to print success message
+print_success() {
+    local msg=$1
+    echo -e "${GREEN}SUCCESS: ${msg}${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: $msg" >> "${DEFAULT_LOG_FILE}" 2>/dev/null
+}
+
+# Function to print warning message
+print_warning() {
+    local msg=$1
+    echo -e "${YELLOW}WARNING: ${msg}${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $msg" >> "${DEFAULT_LOG_FILE}" 2>/dev/null
 }
 
 # Function to print info message
 print_info() {
-    print_msg "$BLUE" "  ℹ️  $1"
+    local msg=$1
+    echo -e "${BLUE}INFO: ${msg}${NC}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $msg" >> "${DEFAULT_LOG_FILE}" 2>/dev/null
 }
 
-# Function to log messages
-log_message() {
-    local level=$1
-    local message=$2
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$LOG_FILE"
+# Function to parse command line arguments
+parse_args() {
+    while getopts ":b:l:" opt; do
+        case "$opt" in
+            b) BACKUP_DIR="${OPTARG:-$DEFAULT_BACKUP_DIR}";;
+            l) LOG_FILE="${OPTARG:-$DEFAULT_LOG_FILE}";;
+            \?) print_error "Invalid option: -$OPTARG"; exit 1;;
+        esac
+    done
 }
 
-# Function to check if running as root
+# Function to validate directories
+validate_directories() {
+    # Create backup directory with proper permissions
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        mkdir -p "$BACKUP_DIR" || { print_error "Failed to create backup directory"; exit 1; }
+        chown root:root "$BACKUP_DIR" || { print_error "Failed to set proper ownership for backup directory"; exit 1; }
+    fi
+
+    # Create log directory if needed
+    local log_dir="${LOG_FILE%/*}"
+    if [[ "$log_dir" != /* ]] || [[ ! -d "$log_dir" ]]; then
+        mkdir -p "$(dirname "$LOG_FILE")" || { print_error "Failed to create log directory"; exit 1; }
+        chown root:root "$(dirname "$LOG_FILE")" || { print_error "Failed to set proper ownership for log directory"; exit 1; }
+    fi
+
+    # Check log file permissions
+    if ! touch "$LOG_FILE" 2>/dev/null || ! chmod 600 "$LOG_FILE" 2>/dev/null; then
+        print_error "No write access to log file"
+        exit 1
+    fi
+}
+
+# Function to check root access
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
         print_info "Try: sudo $0"
         exit 1
-    fi
+    }
 }
 
-# Function to create backup directory
-create_backup_dir() {
-    if [[ ! -d "$BACKUP_DIR" ]]; then
-        mkdir -p "$BACKUP_DIR"
-        print_success "Created backup directory: $BACKUP_DIR"
-    fi
-}
-
-# Function to backup current rules
-backup_rules() {
-    print_header "CREATING BACKUPS"
-    
-    # Create timestamped backup directory
-    mkdir -p "$BACKUP_PATH"
-    
-    # Backup IPv4 rules
-    if iptables-save > "${BACKUP_PATH}/iptables.v4" 2>/dev/null; then
-        print_success "IPv4 rules backed up to: ${BACKUP_PATH}/iptables.v4"
-        log_message "INFO" "IPv4 rules backed up"
-    else
-        print_warning "No IPv4 rules to backup"
-    fi
-    
-    # Backup IPv6 rules
-    if command -v ip6tables-save &>/dev/null; then
-        if ip6tables-save > "${BACKUP_PATH}/ip6tables.v6" 2>/dev/null; then
-            print_success "IPv6 rules backed up to: ${BACKUP_PATH}/ip6tables.v6"
-            log_message "INFO" "IPv6 rules backed up"
-        else
-            print_warning "No IPv6 rules to backup"
+# Function to check system services
+check_system_services() {
+    # Check for nftables
+    if command -v nft &>/dev/null; then
+        print_header "Checking nftables"
+        if nft list ruleset 2>/dev/null | grep -q "table"; then
+            print_warning "nftables is active. Consider disabling it for consistency."
         fi
     fi
-    
-    # Backup UFW status if available
-    if command -v ufw &>/dev/null; then
-        ufw status verbose > "${BACKUP_PATH}/ufw_status.txt" 2>/dev/null
-        print_success "UFW status backed up"
+
+    # Check for firewalld
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet firewalld; then
+        print_header "Checking firewalld"
+        print_warning "firewalld is active. This script focuses on iptables/ufw."
     fi
+}
+
+# Backup functions
+backup_rules() {
+    local backup_date
     
+    # Create timestamped backup directory
+    backup_date=$(date +%Y-%m-%d_%H-%M-%S)
+    BACKUP_DIR="$BACKUP_DIR/${SCRIPT_NAME}_${backup_date}"
+    mkdir -p "$BACKUP_DIR" || { print_error "Failed to create backup directory"; exit 1; }
+    
+    export BACKUP_PATH="$BACKUP_DIR"
+
+    # Backup IPv4 rules
+    if command -v iptables &>/dev/null; then
+        if iptables-save > "${BACKUP_PATH}/iptables.v4" 2>/dev/null; then
+            print_success "IPv4 rules backed up"
+            log_message "ACTION" "IPv4 rules backed up"
+        else
+            print_error "Failed to backup IPv4 rules"
+        fi
+    else
+        print_info "iptables not available, skipping IPv4 backup"
+    fi
+
+    # Backup IPv6 rules
+    if command -v ip6tables &>/dev/null; then
+        if ip6tables-save > "${BACKUP_PATH}/iptables.v6" 2>/dev/null; then
+            print_success "IPv6 rules backed up"
+            log_message "ACTION" "IPv6 rules backed up"
+        else
+            print_error "Failed to backup IPv6 rules"
+        fi
+    else
+        print_info "ip6tables not available, skipping IPv6 backup"
+    fi
+
+    # Backup nftables rules if available
+    if command -v nft &>/dev/null; then
+        if nft list ruleset > "${BACKUP_PATH}/nftables.rules" 2>/dev/null; then
+            print_success "nftables rules backed up"
+            log_message "ACTION" "nftables rules backed up"
+        else
+            print_error "Failed to backup nftables rules"
+        fi
+    else
+        print_info "nftables not available, skipping backup"
+    fi
+
     # Create backup info file
     cat > "${BACKUP_PATH}/backup_info.txt" <<EOF
 Backup Date: $(date)
 Hostname: $(hostname)
 Kernel: $(uname -r)
-OS: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2)
+OS: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2 || echo "Unknown")
 User: $SUDO_USER
 Script Version: $SCRIPT_VERSION
 EOF
-    
+
     print_success "Backup information saved"
 }
 
 # Function to disable UFW
 disable_ufw() {
-    print_header "DISABLING UFW"
-    
-    if ! command -v ufw &>/dev/null; then
-        print_info "UFW is not installed"
-        log_message "INFO" "UFW not installed"
-        return 0
-    fi
-    
-    # Disable UFW
-    if ufw status | grep -q "active"; then
-        ufw --force disable &>/dev/null
-        print_success "UFW disabled"
-        log_message "INFO" "UFW disabled"
+    if command -v ufw &>/dev/null; then
+        print_header "Disabling UFW"
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw disable 2>/dev/null || { print_error "Failed to disable UFW"; return 1; }
+            log_message "ACTION" "UFW disabled"
+        else
+            print_info "UFW is not active"
+        fi
     else
-        print_info "UFW is already disabled"
-    fi
-    
-    # Stop and disable UFW service
-    if systemctl list-unit-files | grep -q ufw; then
-        systemctl stop ufw &>/dev/null || true
-        systemctl disable ufw &>/dev/null || true
-        print_success "UFW service stopped and disabled"
+        print_info "UFW not found, skipping"
     fi
 }
 
-# Function to stop firewall persistence services
+# Function to stop persistence services
 stop_persistence() {
-    print_header "STOPPING PERSISTENCE SERVICES"
+    print_header "Stopping persistence services"
     
-    # List of services to disable
-    local services=(
-        "netfilter-persistent"
-        "iptables-persistent"
-        "firewalld"
-    )
-    
-    for service in "${services[@]}"; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "$service"; then
-            systemctl stop "$service" &>/dev/null || true
-            systemctl disable "$service" &>/dev/null || true
-            print_success "Disabled $service"
-            log_message "INFO" "Disabled $service"
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active --quiet netfilter-persistent; then
+            systemctl stop netfilter-persistent.service || { print_error "Failed to stop netfilter-persistent"; return 1; }
+            log_message "ACTION" "netfilter-persistent stopped"
+        else
+            print_info "netfilter-persistent not active"
         fi
-    done
+        
+        if systemctl is-active --quiet systemd-resolved; then
+            systemctl stop systemd-resolved.service || { print_error "Failed to stop systemd-resolved"; return 1; }
+            log_message "ACTION" "systemd-resolved stopped"
+        else
+            print_info "systemd-resolved not active"
+        fi
+    else
+        print_info "systemctl not available, skipping service checks"
+    fi
 }
 
-# Function to reset IPv4 rules
-reset_ipv4() {
-    print_header "RESETTING IPv4 RULES"
+# Function to reset firewall rules
+reset_firewall_rules() {
+    print_header "Resetting firewall rules"
     
-    # Set default policies to ACCEPT
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-    print_success "Default policies set to ACCEPT"
-    
-    # Flush all rules and delete custom chains
-    local tables=("filter" "nat" "mangle" "raw" "security")
-    
-    for table in "${tables[@]}"; do
-        if iptables -t "$table" -L &>/dev/null; then
-            iptables -t "$table" -F 2>/dev/null || true
-            iptables -t "$table" -X 2>/dev/null || true
-            print_success "Cleaned table: $table"
-        fi
-    done
-    
-    # Verify IPv4 rules are empty
-    if iptables -L | grep -q "Chain"; then
-        print_success "IPv4 rules have been reset"
+    # Check for iptables
+    if command -v iptables &>/dev/null; then
+        # Flush all chains
+        iptables -F 2>/dev/null || { print_error "Failed to flush iptables rules"; return 1; }
+        iptables -t nat -F 2>/dev/null || { print_error "Failed to flush iptables nat rules"; return 1; }
+        iptables -t mangle -F 2>/dev/null || { print_error "Failed to flush iptables mangle rules"; return 1; }
+        iptables -t filter -F 2>/dev/null || { print_error "Failed to flush iptables filter rules"; return 1; }
+        
+        # Delete all user-defined chains
+        for chain in $(iptables -S 2>/dev/null | awk '/^-A [^-]/ {print $3}' | uniq); do
+            iptables -X "$chain" 2>/dev/null || true
+        done
+        
+        log_message "ACTION" "iptables rules flushed"
+        print_success "iptables rules reset to default"
+    else
+        print_info "iptables not available, skipping reset"
     fi
-    
-    log_message "INFO" "IPv4 rules reset"
-}
 
-# Function to reset IPv6 rules
-reset_ipv6() {
-    print_header "RESETTING IPv6 RULES"
-    
-    if ! command -v ip6tables &>/dev/null; then
-        print_warning "ip6tables not available, skipping IPv6"
-        return 0
+    # Check for ip6tables
+    if command -v ip6tables &>/dev/null; then
+        # Flush all chains
+        ip6tables -F 2>/dev/null || { print_error "Failed to flush ip6tables rules"; return 1; }
+        ip6tables -t nat -F 2>/dev/null || { print_error "Failed to flush ip6tables nat rules"; return 1; }
+        ip6tables -t mangle -F 2>/dev/null || { print_error "Failed to flush ip6tables mangle rules"; return 1; }
+        ip6tables -t filter -F 2>/dev/null || { print_error "Failed to flush ip6="tables filter rules"; return 1; }
+        
+        # Delete all user-defined chains
+        for chain in $(ip6tables -S 2>/dev/null | awk '/^-A [^-]/ {print $3}' | uniq); do
+            ip6tables -X "$chain" 2>/dev/null || true
+        done
+        
+        log_message "ACTION" "ip6tables rules flushed"
+        print_success "ip6tables rules reset to default"
+    else
+        print_info "ip6tables not available, skipping reset"
     fi
-    
-    # Set default policies to ACCEPT
-    ip6tables -P INPUT ACCEPT 2>/dev/null || true
-    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
-    ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
-    print_success "Default IPv6 policies set to ACCEPT"
-    
-    # Flush all rules and delete custom chains
-    local tables=("filter" "nat" "mangle" "raw" "security")
-    
-    for table in "${tables[@]}"; do
-        if ip6tables -t "$table" -L &>/dev/null 2>&1; then
-            ip6tables -t "$table" -F 2>/dev/null || true
-            ip6tables -t "$table" -X 2>/dev/null || true
-            print_success "Cleaned IPv6 table: $table"
-        fi
-    done
-    
-    log_message "INFO" "IPv6 rules reset"
+
+    # Check for nftables
+    if command -v nft &>/dev/null; then
+        print_header "Resetting nftables rules"
+        nft flush ruleset 2>/dev/null || { print_error "Failed to reset nftables rules"; return 1; }
+        log_message "ACTION" "nftables rules reset to default"
+        print_success "nftables rules reset to default"
+    else
+        print_info "nftables not available, skipping reset"
+    fi
 }
 
 # Function to show open ports
 show_open_ports() {
-    print_header "CURRENT OPEN PORTS"
+    print_header "Showing open ports"
     
-    if command -v ss &>/dev/null; then
-        ss -tulpn | grep LISTEN | column -t || true
+    # List active ports
+    if command -v nmap &>/dev/null; then
+        nmap -pT -sS -O -T4 -A -v 2>/dev/null || { print_error "nmap not available for port scanning"; return 1; }
+    elif command -v ss &>/dev/null; then
+        ss -a 2>/dev/null || { print_error "ss not available for port listing"; return 1; }
     elif command -v netstat &>/dev/null; then
-        netstat -tulpn | grep LISTEN || true
+        netstat -tulnp 2>/dev/null || { print_error "netstat not available for port listing"; return 1; }
     else
-        print_warning "Neither ss nor netstat found"
+        print_info "No port listing tool available"
     fi
+    
+    log_message "INFO" "Open ports shown"
 }
 
-# Function to verify SSH access
-verify_ssh() {
-    print_header "SSH ACCESS VERIFICATION"
+# Function to save configuration
+save_configuration() {
+    print_header "Saving configuration"
     
-    if systemctl is-active ssh &>/dev/null || systemctl is-active sshd &>/dev/null; then
-        print_success "SSH service is running"
-        
-        # Check if SSH is listening on port 22
-        if ss -tlnp 2>/dev/null | grep -q ":22 "; then
-            print_success "SSH is listening on port 22"
-        else
-            print_warning "SSH might not be listening on default port 22"
-        fi
+    if [[ -f "$LOG_FILE" ]]; then
+        chown root:root "$LOG_FILE" || { print_error "Failed to set proper ownership for log file"; return 1; }
+        print_info "Log file saved: $LOG_FILE"
     else
-        print_error "SSH service is not running!"
-        print_warning "You might lose access after reboot!"
+        print_error "No log file to save"
     fi
-}
-
-# Function to save empty rules (optional)
-save_rules() {
-    print_header "SAVE EMPTY RULES"
-    print_info "Do you want to save empty rules to make them persistent after reboot?"
-    print_info "(This ensures firewall stays disabled after reboot) [y/N]: "
     
-    read -r answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        if command -v netfilter-persistent-save &>/dev/null; then
-            netfilter-persistent-save
-            print_success "Rules saved via netfilter-persistent"
-        elif command -v iptables-save &>/dev/null; then
-            # Try to save in common locations
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-            print_success "Rules saved to /etc/iptables/"
-        else
-            print_warning "No method found to save rules permanently"
-        fi
-        log_message "INFO" "Empty rules saved"
+    if [[ -d "$BACKUP_DIR" ]]; then
+        chown root:root "$BACKUP_DIR" || { print_error "Failed to set proper ownership for backup directory"; return 1; }
+        print_info "Backup directory saved: $BACKUP_DIR"
     else
-        print_info "Rules not saved (will reset after reboot)"
+        print_error "No backup directory"
     fi
-}
-
-# Function to show summary
-show_summary() {
-    print_header "SUMMARY"
     
-    echo -e "${GREEN}✅ Firewall has been reset to default ACCEPT ALL${NC}"
-    echo -e "${BLUE}📁 Backups:${NC} $BACKUP_PATH"
-    echo -e "${BLUE}📋 Log file:${NC} $LOG_FILE"
-    echo
-    echo -e "${YELLOW}⚠️  Important Notes:${NC}"
-    echo "  • All iptables rules have been cleared"
-    echo "  • UFW has been disabled"
-    echo "  • Default policy is ACCEPT for all chains"
-    echo "  • SSH should be accessible on port 22"
-    echo
-    echo -e "${GREEN}🎯 Script execution completed successfully!${NC}"
+    log_message "INFO" "Configuration saved"
 }
 
 # Main function
 main() {
-    print_header "FW_NULL v${SCRIPT_VERSION}"
-    print_info "Firewall Nullifier Script"
-    print_info "Starting firewall reset process..."
-    
-    # Check requirements
+    parse_args "$@"
+    validate_directories
     check_root
     
-    # Create log file
-    touch "$LOG_FILE"
-    log_message "INFO" "Script started by user $SUDO_USER"
+    # Create temporary directory
+    mkdir -p "$TMP_DIR" || { print_error "Failed to create temporary directory"; exit 1; }
     
-    # Main execution
-    create_backup_dir
+    # Initialize log file
+    if [[ ! -f "$LOG_FILE" ]]; then
+        touch "$LOG_FILE"
+        print_info "Log file created: $LOG_FILE"
+    fi
+    
+    # Backup current rules
     backup_rules
-    disable_ufw
-    stop_persistence
-    reset_ipv4
-    reset_ipv6
-    show_open_ports
-    verify_ssh
-    save_rules
-    show_summary
     
-    log_message "INFO" "Script completed successfully"
+    # Disable UFW if present
+    disable_ufw
+    
+    # Stop persistence services
+    stop_persistence
+    
+    # Reset firewall rules
+    reset_firewall_rules
+    
+    # Show open ports
+    show_open_ports
+    
+    # Save configuration
+    save_configuration
+    
+    print_success "Firewall reset completed successfully"
+    print_info "Backup directory: $BACKUP_DIR"
+    print_info "Log file: $LOG_FILE"
 }
 
-# Trap errors
-trap 'print_error "An error occurred on line $LINENO"; exit 1' ERR
-
-# Run main function
+# Execute main function
 main "$@"
-
-exit 0
